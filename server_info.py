@@ -22,6 +22,12 @@ class ErrParse(Exception):
 
 
 # JSON response
+class env:
+    def __init__(self, control_host: str, relay_region: str):
+        self.control_host = control_host
+        self.relay_region = relay_region
+
+
 class smartdns:
     def __init__(self, host: str, external: str, externalv6: str, lan: List[str], lanv6: List[str], hole_punch: str):
         self.host = host
@@ -33,8 +39,9 @@ class smartdns:
 
 
 class serverInfo:
-    def __init__(self, Command: str, ErrNo: int, Service: 'service', Server: 'server', Smartdns: 'smartdns'):
+    def __init__(self, Command: str, Env: env, ErrNo: int, Service: 'service', Server: 'server', Smartdns: 'smartdns'):
         self.Command = Command
+        self.Env = Env
         self.ErrNo = ErrNo
         self.Service = Service
         self.Server = Server
@@ -43,7 +50,7 @@ class serverInfo:
 
 class service:
     def __init__(self, Port: int, ExtPort: int, RelayIP: str, RelayIPv6: str, RelayPort: int, HttpsIP: str,
-                 HttpsPort: int):
+                 HttpsPort: int, PingpongDesc: list[str]):
         self.Port = Port
         self.ExtPort = ExtPort
         self.RelayIP = RelayIP
@@ -51,6 +58,7 @@ class service:
         self.RelayPort = RelayPort
         self.HttpsIP = HttpsIP
         self.HttpsPort = HttpsPort
+        self.PingpongDesc = PingpongDesc
 
 
 class server:
@@ -117,72 +125,82 @@ def new_request_body(cmd: str, typ: str, serverID: str) -> BytesIO:
 
 def get_server_info(ctx, c: requests.Session, serv_url: str, id: str) -> List[serverInfo]:
     req_body = new_request_body("get_server_info", "mainapp", id)
-    try:
-        with c.post(serv_url, data=req_body.read(), timeout=DEFAULT_TIMEOUT) as resp:
-            resp.raise_for_status()
 
-            info_list = resp.json()
-            print(info_list)
-            if len(info_list) != 2:
-                raise ErrParse
+    with c.post(serv_url, data=req_body.read(), timeout=DEFAULT_TIMEOUT) as resp:
+        resp.raise_for_status()
 
-            info = []
-            for item in info_list:
-                if item["errno"] != 0:
-                    print(f"get_server_info returned errno={item['errno']}")
-                    info.append(serverInfo(Command=item["command"], ErrNo=item["errno"],
-                                           Service=service(0, 0, "", "", 0, "", 0),
-                                           Server=server("", "", extIPs("", ""), [], ""),
-                                           Smartdns=smartdns("", "", "", [], [], "")))
-                    continue
+        info_list = resp.json()
+        print(info_list)
+        if len(info_list) != 2:
+            raise ErrParse
 
-                service_data = item["service"]
-                server_data = item["server"]
-                smartdns_data = item["smartdns"]
+        info = []
+        errno_not_zero = False
 
-                service_obj = service(
-                    Port=service_data.get("port", ""),
-                    ExtPort=service_data.get("ext_port", ""),
-                    RelayIP=service_data.get("relay_ip", ""),
-                    RelayIPv6=service_data.get("relay_ipv6", ""),
-                    RelayPort=service_data.get("relay_port", ""),
-                    HttpsIP=service_data.get("https_ip", ""),
-                    HttpsPort=service_data.get("https_port", "")
-                )
+        for item in info_list:
+            if item["errno"] != 0:
+                print(f"get_server_info returned errno={item['errno']}")
+                info.append(serverInfo(Command=item["command"], ErrNo=item["errno"],
+                                       Env=env("", ""),
+                                       Service=service(0, 0, "", "", 0, "", 0, []),
+                                       Server=server("", "", extIPs("", ""), [], ""),
+                                       Smartdns=smartdns("", "", "", [], [], "")))
+                continue
+            else:
+                errno_not_zero = True
 
-                external_data = server_data["external"]
-                external_obj = extIPs(
-                    IP=external_data["ip"],
-                    IPv6=external_data["ipv6"]
-                )
+            service_data = item["service"]
+            server_data = item["server"]
+            smartdns_data = item["smartdns"]
+            env_data = item["env"]
 
-                interface_list = []
-                for iface_data in server_data["interface"]:
-                    ipv6_list = [ipv6(Address=ip["address"], Scope=ip["scope"]) for ip in iface_data["ipv6"]]
-                    interface_list.append(iface(IP=iface_data["ip"], IPv6=ipv6_list))
+            env_obj = env(control_host=env_data.get("control_host", ""),
+                          relay_region=env_data.get("relay_region", ""))
 
-                server_obj = server(
-                    DDNS=server_data.get("ddns", ""),
-                    FQDN=server_data.get("fqdn", ""),
-                    External=external_obj,
-                    Interface=interface_list,
-                    ServerID=server_data.get("serverID", "")
-                )
+            service_obj = service(
+                Port=service_data.get("port", ""),
+                ExtPort=service_data.get("ext_port", ""),
+                RelayIP=service_data.get("relay_ip", ""),
+                RelayIPv6=service_data.get("relay_ipv6", ""),
+                RelayPort=service_data.get("relay_port", ""),
+                HttpsIP=service_data.get("https_ip", ""),
+                HttpsPort=service_data.get("https_port", ""),
+                PingpongDesc=service_data.get("pingpong_desc", [])
+            )
 
-                smartdns_obj = smartdns(
-                    host=smartdns_data.get("host", ""),
-                    external=smartdns_data.get("external", ""),
-                    externalv6=smartdns_data.get("externalv6", ""),
-                    lan=smartdns_data.get("lan", []),
-                    lanv6=smartdns_data.get("lanv6", []),
-                    hole_punch=smartdns_data.get("hole_punch", "")
-                )
+            external_data = server_data["external"]
+            external_obj = extIPs(
+                IP=external_data["ip"],
+                IPv6=external_data["ipv6"]
+            )
 
-                info.append(
-                    serverInfo(Command=item["command"], ErrNo=item["errno"], Service=service_obj, Server=server_obj,
-                               Smartdns=smartdns_obj))
+            interface_list = []
+            for iface_data in server_data["interface"]:
+                ipv6_list = [ipv6(Address=ip["address"], Scope=ip["scope"]) for ip in iface_data["ipv6"]]
+                interface_list.append(iface(IP=iface_data["ip"], IPv6=ipv6_list))
 
-            return info
+            server_obj = server(
+                DDNS=server_data.get("ddns", ""),
+                FQDN=server_data.get("fqdn", ""),
+                External=external_obj,
+                Interface=interface_list,
+                ServerID=server_data.get("serverID", "")
+            )
 
-    except requests.RequestException as e:
-        raise Exception(f"Request failed: {e}")
+            smartdns_obj = smartdns(
+                host=smartdns_data.get("host", ""),
+                external=smartdns_data.get("external", ""),
+                externalv6=smartdns_data.get("externalv6", ""),
+                lan=smartdns_data.get("lan", []),
+                lanv6=smartdns_data.get("lanv6", []),
+                hole_punch=smartdns_data.get("hole_punch", "")
+            )
+
+            info.append(
+                serverInfo(Command=item["command"], Env=env_obj, ErrNo=item["errno"], Service=service_obj,
+                           Server=server_obj,
+                           Smartdns=smartdns_obj))
+
+        if not errno_not_zero:
+            raise ErrParse
+        return info

@@ -1,20 +1,22 @@
 import contextlib
 import threading
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 from enum import Enum
 from info import Info, Record
 
-from server_info import serverInfo, new_request_body, get_server_info, ErrParse, ErrUnknownCommand, ErrUnknownServerType
-from info import httpsSmartLanIPv4, httpLanIPv4, httpsTun, maxRecordType, is_https as is_https_info, \
-    is_local_ip as is_local_ip_info
+from server_info import serverInfo, get_server_info
+from info import maxRecordType, is_https as is_https_info, is_local_ip as is_local_ip_info
 
 # 导入自定义错误
-from errors import ErrTimeout, ErrCancelled, ErrCannotAccess, PingFailureError
+from errors import ErrTimeout, ErrCannotAccess, PingFailureError
 
 # 默认客户端设置
-DEFAULT_TIMEOUT = 5
-DEFAULT_SERV_URL = "https://dec.quickconnect.to/Serv.php"
+DEFAULT_TIMEOUT = 10
+DEFAULT_SERV_URL_DEC = "https://dec.quickconnect.to/Serv.php"
+DEFAULT_SERV_URL_GLOBAL = "https://global.quickconnect.to/Serv.php"
 
 
 class State(Enum):
@@ -27,7 +29,7 @@ class Client:
     def __init__(self, client=None, timeout=0, serv_url=""):
         self.client = client
         self.timeout = timeout
-        self.serv_url = serv_url if serv_url else DEFAULT_SERV_URL
+        self.serv_url = serv_url if serv_url else DEFAULT_SERV_URL_DEC
 
     def get_info(self, ctx, id: str):
         rs = Info()
@@ -39,10 +41,14 @@ class Client:
 
             http_client = self.client if self.client else requests.Session()
 
-            serv_url = self.serv_url if self.serv_url else DEFAULT_SERV_URL
+            serv_url = self.serv_url if self.serv_url else DEFAULT_SERV_URL_DEC
 
             # 获取服务器上的信息
-            info = get_server_info(ctx, http_client, serv_url, id)
+            try:
+                info = get_server_info(ctx, http_client, serv_url, id)
+            except Exception as e:
+                info = get_server_info(ctx, http_client, DEFAULT_SERV_URL_GLOBAL, id)
+
             if isinstance(info, Exception):
                 return rs, info
 
@@ -69,31 +75,46 @@ class Client:
                     protocol = "https://"
                     if server_info.Service.HttpsIP is not None and server_info.Service.HttpsIP != "" and server_info.Service.HttpsPort is not None and server_info.Service.HttpsPort != 0:
                         rs.Records.append(
-                            Record(URL=f"{protocol}{server_info.Service.HttpsIP}:{server_info.Service.HttpsPort}",
-                                   Type=url_type))
+                            Record(
+                                URL=f"{protocol}{id}.{server_info.Env.relay_region}.quickconnect.to:{server_info.Service.HttpsPort}",
+                                Type=url_type))
                 else:
                     url_type = 13
                     protocol = "http://"
                     if server_info.Service.RelayIP is not None and server_info.Service.RelayIP != "" and server_info.Service.RelayPort is not None and server_info.Service.RelayPort != 0:
                         rs.Records.append(
-                            Record(URL=f"{protocol}{server_info.Service.RelayIP}:{server_info.Service.RelayPort}",
-                                   Type=url_type))
+                            Record(
+                                URL=f"{protocol}{id}.{server_info.Env.relay_region}.quickconnect.to:{server_info.Service.RelayPort}",
+                                Type=url_type))
                 # 添加记录
                 add_record_if_valid(rs, server_info.Server.DDNS, server_info.Service.Port, url_type, protocol)
+                add_record_if_valid(rs, server_info.Server.DDNS, server_info.Service.ExtPort, url_type, protocol)
+
+                add_record_if_valid(rs, server_info.Server.FQDN, server_info.Service.Port, url_type, protocol)
+                add_record_if_valid(rs, server_info.Server.FQDN, server_info.Service.ExtPort, url_type, protocol)
+
                 add_record_if_valid(rs, server_info.Smartdns.host, server_info.Service.Port, url_type, protocol)
+                add_record_if_valid(rs, server_info.Smartdns.host, server_info.Service.ExtPort, url_type, protocol)
+
                 add_record_if_valid(rs, server_info.Smartdns.externalv6, server_info.Service.Port, url_type, protocol)
+                add_record_if_valid(rs, server_info.Smartdns.externalv6, server_info.Service.ExtPort, url_type,
+                                    protocol)
+
+                for host_pingpong_desc in server_info.Service.PingpongDesc:
+                    add_record_if_valid(rs, host_pingpong_desc, server_info.Service.Port, url_type, protocol)
+                    add_record_if_valid(rs, host_pingpong_desc, server_info.Service.ExtPort, url_type, protocol)
                 for host_lan in server_info.Smartdns.lan:
                     add_record_if_valid(rs, host_lan, server_info.Service.Port, url_type, protocol)
+                    add_record_if_valid(rs, host_lan, server_info.Service.ExtPort, url_type, protocol)
                 for host_lanv6 in server_info.Smartdns.lanv6:
                     add_record_if_valid(rs, host_lanv6, server_info.Service.Port, url_type, protocol)
+                    add_record_if_valid(rs, host_lanv6, server_info.Service.ExtPort, url_type, protocol)
             return rs, None
 
     def update_state(self, ctx, info: Info):
-        err = None
-        wg = threading.Event()
+        error_info = {'value': None}
         timeout = threading.Timer(self.timeout if self.timeout > 0 else DEFAULT_TIMEOUT,
-                                  lambda: setattr(err, 'value', ErrTimeout))
-        ch = []
+                                  lambda: error_info.update({'value': ErrTimeout}))
 
         if not ctx:
             ctx = contextlib.nullcontext()
@@ -108,51 +129,34 @@ class Client:
                 try:
                     hash_value, err_ping = self.ping(ctx, r.URL)
                     if err_ping:
-                        # if ctx.exc_info()[0]:
-                        #     return
                         r.State = State.ConnectFailed
-                        ch.append(r)
                         return
 
-                    # 验证ID
                     if not verify_id(info.ServerID, hash_value):
                         r.State = State.InvalidServer
-                        ch.append(r)
                         return
 
                     r.State = State.OK
-                    ch.append(r)
+                    return
 
-                finally:
-                    wg.set()
+                except Exception as e:
+                    r.State = State.ConnectFailed
+                    return
 
-            for r in info.Records:
-                threading.Thread(target=ping_url, args=(r,)).start()
+            futures = []
+            with ThreadPoolExecutor(max_workers=10) as executor:  # 限制并发请求数量
+                for r in info.Records:
+                    futures.append(executor.submit(ping_url, r))
 
-            while not err:
-                if ch:
-                    r = ch.pop(0)
-                    for i, record in enumerate(info.Records):
-                        if r.URL == record.URL:
-                            info.Records[i].State = r.State
-                            break
-
-                if timeout.is_alive():
-                    timeout.cancel()
-                    err = ErrTimeout
+            for future in as_completed(futures):
+                if future.exception():
+                    err = future.exception()
                     break
 
-                if ctx.exc_info()[0]:
-                    err = ErrCancelled
-                    break
-
+            timeout.cancel()
             timeout.join()
-            wg.wait()
 
-            if err == ErrTimeout:
-                return None
-
-            return err
+            return None
 
     def ping(self, ctx, url: str):
         """
@@ -172,10 +176,12 @@ class Client:
 
                 if not json_resp.get('success', False):
                     return "", PingFailureError
+                print(f"Ping success: {url} \n")
 
                 return json_resp.get('ezid', ""), None
 
         except Exception as e:
+            print(f"Ping failed: {url} \n")
             return "", PingFailureError(f"Ping failed: {e}")
 
     def resolve(self, ctx, id: str):
@@ -230,7 +236,7 @@ added_urls = set()
 
 
 def add_record_if_valid(rs, url, port, url_type, protocol):
-    if url is not None and url != "" and port is not None and port != "":
+    if url is not None and url != "" and url != 'NULL' and port is not None and port != 0:
         full_url = f"{protocol}{url}:{port}"
         if full_url not in added_urls:
             rs.Records.append(Record(URL=full_url, Type=url_type))
@@ -238,4 +244,4 @@ def add_record_if_valid(rs, url, port, url_type, protocol):
 
 
 if __name__ == '__main__':
-    print(DefaultClient.resolve(None, "hello"))
+    print(DefaultClient.resolve(None, "youngfilestore"))  # nzaragosa 同时发tunnel host是control_host，后面处理逻辑基本一致
